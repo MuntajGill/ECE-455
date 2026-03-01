@@ -7,6 +7,7 @@
 #include "stm32f4_discovery.h"
 #include "stm32f4xx_adc.h"
 #include "stm32f4xx_gpio.h"
+#include <stdlib.h>   // for rand()
 
 /* RTOS includes - FreeRTOS middleware */
 #include "stm32f4xx.h"
@@ -17,10 +18,12 @@
 #include "../FreeRTOS_Source/include/timers.h"
 
 /*-----------------------------------------------------------*/
+#define ROAD_LENGTH        20     // Total LED positions
+#define STOP_INDEX         7     // Last index BEFORE intersection
 
 // Flow rate boundaries for ADC scaling
-#define FLOW_LOW		40
-#define FLOW_HIGH		4000
+#define FLOW_LOW		0
+#define FLOW_HIGH		4095
 
 // 100ms tick interval for periodic tasks
 #define TICK_INTERVAL	pdMS_TO_TICKS(100)
@@ -92,7 +95,7 @@ int main(void)
 		xTaskCreate( TrafficControllerTask, "TrafficController", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 		xTaskCreate( LightSequenceTask, "LightSequence", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
 		xTaskCreate( VehicleGeneratorTask, "VehicleGenerator", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
-		xTaskCreate( VisualDisplayTask, "VisualDisplay", configMINIMAL_STACK_SIZE, NULL, 1, NULL);
+		xTaskCreate( VisualDisplayTask, "VisualDisplay", 256, NULL, 2, NULL);
 
 		// Create timers for light sequence (FreeRTOS middleware)
 		GreenLightTimer  = xTimerCreate("GreenTimer", pdMS_TO_TICKS(5000), pdFALSE, 0, GreenTimerCallback);
@@ -132,6 +135,9 @@ void SetupGPIOPorts()
 	PortConfig.GPIO_Mode = GPIO_Mode_OUT;
 	PortConfig.GPIO_Speed = GPIO_Speed_50MHz;
 	GPIO_Init(GPIOC, &PortConfig);
+
+	// Prevent reset holdup
+	GPIO_SetBits(GPIOC, SHIFT_RST);
 }
 
 /*-----------------------------------------------------------*/
@@ -153,7 +159,7 @@ void SetupADCModule()
 	// Apply settings and enable ADC
 	ADC_Init(ADC1, &ADC_Config);
 	ADC_Cmd(ADC1, ENABLE);
-	
+
 	// Configure ADC channel 13 (connected to PC3/potentiometer)
 	ADC_RegularChannelConfig(ADC1, ADC_Channel_13, 1, ADC_SampleTime_144Cycles);
 }
@@ -163,12 +169,12 @@ void SetupADCModule()
 uint16_t ReadPotentiometer(void)
 {
 	ADC_SoftwareStartConv(ADC1);
-	
-	while (!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC)) 
-	{ 
+
+	while (!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC))
+	{
 		// Wait for ADC conversion
 	}
-	
+
 	return ADC_GetConversionValue(ADC1);
 }
 
@@ -178,29 +184,24 @@ uint16_t ReadPotentiometer(void)
 void TrafficControllerTask( void *pvParameters )
 {
 	int flow_percentage;
-	uint16_t raw_value;
-	
+	int raw_value;
+
 	for(;;)
 	{
 		raw_value = ReadPotentiometer();
-		
-		// Convert ADC value to percentage with bounds checking
-		if(raw_value < FLOW_LOW) 
-		{
-			flow_percentage = 0;
-		}
-		else if(raw_value > FLOW_HIGH) 
-		{
-			flow_percentage = 100;
-		}
-		else 
-		{
-			flow_percentage = (100 * (raw_value - FLOW_LOW)) / (FLOW_HIGH - FLOW_LOW);
-		}
-		
+
+		// Convert ADC value to flow percentage
+		flow_percentage = (100 * (raw_value - FLOW_LOW) / (FLOW_HIGH - FLOW_LOW));
+
+
+		if(flow_percentage > 100) flow_percentage = 100;
+		if(flow_percentage < 0) flow_percentage = 0;
+
+
 		// Update flow rate in queue (FreeRTOS middleware)
 		xQueueOverwrite(FlowRateQueue, &flow_percentage);
-		vTaskDelay(TICK_INTERVAL);
+		vTaskDelay(TICK_INTERVAL); // Scale to 500ms
+
 	}
 }
 
@@ -211,10 +212,10 @@ void LightSequenceTask( void *pvParameters )
 {
 	// Start with green light (FreeRTOS middleware)
 	xTimerStart(GreenLightTimer, 0);
-	
+
 	uint16_t current_light = LED_G;
 	xQueueOverwrite(LightStateQueue, &current_light);
-	
+
 	for(;;)
 	{
 		vTaskDelay(100 * TICK_INTERVAL);
@@ -228,7 +229,7 @@ void GreenTimerCallback( TimerHandle_t xTimer )
 {
 	// Start yellow light timer (FreeRTOS middleware)
 	xTimerStart(YellowLightTimer, 0);
-	
+
 	uint16_t current_light = LED_Y;
 	xQueueOverwrite(LightStateQueue, &current_light);
 }
@@ -241,12 +242,12 @@ void YellowTimerCallback( TimerHandle_t xTimer )
 	int traffic_flow;
 	// Get current flow rate from queue (FreeRTOS middleware)
 	BaseType_t queue_result = xQueuePeek(FlowRateQueue, &traffic_flow, TICK_INTERVAL);
-	
+
 	if(queue_result == pdPASS)
 	{
 		// Adjust red light duration based on flow (FreeRTOS middleware)
 		xTimerChangePeriod(RedLightTimer, pdMS_TO_TICKS(10000 - 50 * traffic_flow), 0);
-		
+
 		uint16_t current_light = LED_R;
 		xQueueOverwrite(LightStateQueue, &current_light);
 	}
@@ -260,12 +261,12 @@ void RedTimerCallback( TimerHandle_t xTimer )
 	int traffic_flow;
 	// Get current flow rate from queue (FreeRTOS middleware)
 	BaseType_t queue_result = xQueuePeek(FlowRateQueue, &traffic_flow, TICK_INTERVAL);
-	
+
 	if(queue_result == pdPASS)
 	{
 		// Adjust green light duration based on flow (FreeRTOS middleware)
 		xTimerChangePeriod(GreenLightTimer, pdMS_TO_TICKS(5000 + 50 * traffic_flow), 0);
-		
+
 		uint16_t current_light = LED_G;
 		xQueueOverwrite(LightStateQueue, &current_light);
 	}
@@ -277,18 +278,33 @@ void RedTimerCallback( TimerHandle_t xTimer )
 void VehicleGeneratorTask( void *pvParameters )
 {
 	int traffic_flow;
-	int new_vehicle = CAR_PRESENT;
+	int new_vehicle;
+	int delay;
 	BaseType_t queue_result;
-	
-	for(;;)
-	{
-		// Check current flow rate (FreeRTOS middleware)
+
+	for(;;){
+		// Check current flow rate
 		queue_result = xQueuePeek(FlowRateQueue, &traffic_flow, TICK_INTERVAL);
-		
-		if(queue_result == pdPASS)
-		{
+		if(queue_result == pdPASS){
+			// Compute probability from flow: higher flow, higher chance
+			if(rand() % 100 < traffic_flow){              // probabilistically generate vehicle using probability from flow: higher flow, higher chance
+				new_vehicle = CAR_PRESENT;
+			} else {
+				new_vehicle = NO_CAR;		// clear queue
+			}
 			xQueueOverwrite(VehicleQueue, &new_vehicle);
-			vTaskDelay(pdMS_TO_TICKS(4000 - 35 * traffic_flow));
+
+			vTaskDelay(pdMS_TO_TICKS(500));
+
+			// Clear queue so display does not keep spawning after clock cycle
+			new_vehicle = NO_CAR;
+			xQueueOverwrite(VehicleQueue, &new_vehicle);
+
+			// Safeguard against negative delay
+			delay = 4000 - 35 * traffic_flow;
+			if(delay < 500) delay = 500;
+			if(delay > 3000) delay = 3000;
+			vTaskDelay(pdMS_TO_TICKS(delay)); // Wait before next vehicle check
 		}
 	}
 }
@@ -298,116 +314,128 @@ void VehicleGeneratorTask( void *pvParameters )
 // Task: Updates all visual outputs (LEDs and car display)
 void VisualDisplayTask( void *pvParameters )
 {
-	BaseType_t light_status, vehicle_status;
-	uint16_t active_light;
-	int vehicle_data;
-	int vehicle_positions[20];
-	int index = 0;
-	
-	// Initialize all car positions to empty
-	while(index < 20)
-	{
-		vehicle_positions[index] = NO_CAR;
-		index++;
-	}
-	
-	GPIO_SetBits(GPIOC, SHIFT_RST);
-	
-	for(;;)
-	{
-		// Get current light state from queue (FreeRTOS middleware)
-		light_status = xQueuePeek(LightStateQueue, &active_light, TICK_INTERVAL);
-		
-		if(light_status == pdPASS)
-		{
-			GPIO_ResetBits(GPIOC, LED_R);
-			GPIO_ResetBits(GPIOC, LED_Y);
-			GPIO_ResetBits(GPIOC, LED_G);
-			GPIO_SetBits(GPIOC, active_light);
-		}
-		
-		// Display cars using shift register
-		index = 19;
-		while(index >= 0)
-		{
-			if(vehicle_positions[index] == CAR_PRESENT)
-				GPIO_SetBits(GPIOC, SHIFT_DATA);
-			else
-				GPIO_ResetBits(GPIOC, SHIFT_DATA);
-			
-			GPIO_SetBits(GPIOC, SHIFT_CLK);
-			GPIO_ResetBits(GPIOC, SHIFT_CLK);
-			index--;
-		}
-		
-		// Move cars based on traffic light state
-		if(active_light == LED_G)
-		{
-			index = 19;
-			while(index > 0)
-			{
-				vehicle_positions[index] = vehicle_positions[index - 1];
-				index--;
-			}
-		}
-		else
-		{
-			// Red or Yellow: cars stop at intersection
-			index = 8;
-			while(index > 0)
-			{
-				if(vehicle_positions[index] == NO_CAR)
-				{
-					vehicle_positions[index] = vehicle_positions[index - 1];
-					vehicle_positions[index - 1] = NO_CAR;
-				}
-				index--;
-			}
-			
-			index = 19;
-			while(index > 9)
-			{
-				vehicle_positions[index] = vehicle_positions[index - 1];
-				vehicle_positions[index - 1] = NO_CAR;
-				index--;
-			}
-		}
-		
-		// Check if new car has arrived (FreeRTOS middleware)
-		vehicle_status = xQueueReceive(VehicleQueue, &vehicle_data, pdMS_TO_TICKS(100));
-		vehicle_positions[0] = NO_CAR;
-		
-		if(vehicle_status == pdPASS && vehicle_data == CAR_PRESENT)
-		{
-			vehicle_positions[0] = CAR_PRESENT;
-		}
-		
-		vTaskDelay(5 * TICK_INTERVAL);
-	}
+    BaseType_t light_status, vehicle_status;
+    uint16_t active_light = LED_G;   // Safe default
+    int vehicle_data;
+    int vehicle_positions[ROAD_LENGTH];
+    int index;
+    volatile int transition;
+
+
+    // Initialize all positions to empty
+    for(index = 0; index < ROAD_LENGTH; index++)
+    {
+        vehicle_positions[index] = NO_CAR;
+    }
+
+    // Reset shift register
+    GPIO_ResetBits(GPIOC, SHIFT_RST);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    GPIO_SetBits(GPIOC, SHIFT_RST);
+
+    // Clear all outputs across PCB
+    for(index = 0; index < ROAD_LENGTH-1; index++)
+    {
+    	GPIO_ResetBits(GPIOC, SHIFT_DATA);
+    	GPIO_SetBits(GPIOC, SHIFT_CLK);
+    	GPIO_ResetBits(GPIOC, SHIFT_CLK);
+    }
+
+    for(;;)
+    {
+        light_status = xQueuePeek(LightStateQueue, &active_light, 0);
+
+        if(light_status == pdPASS)
+        {
+            GPIO_ResetBits(GPIOC, LED_R | LED_Y | LED_G);
+            GPIO_SetBits(GPIOC, active_light);
+        }
+
+        // Shift out vehicle positions to LED display (index 18-0) - skip index 19
+        for(index = ROAD_LENGTH - 1; index >= 0; index--)
+        {
+                if(vehicle_positions[index] == CAR_PRESENT) {
+                	GPIO_SetBits(GPIOC, SHIFT_DATA);
+                } else {
+                	GPIO_ResetBits(GPIOC, SHIFT_DATA);
+                }
+
+                // Generated FOR loop to delay between transitions
+
+                for(transition=0; transition<100; transition++){}
+
+                GPIO_SetBits(GPIOC, SHIFT_CLK);
+
+                for(transition=0; transition<100; transition++){}
+
+                GPIO_ResetBits(GPIOC, SHIFT_CLK);
+        }
+
+
+        if(active_light == LED_G)
+        {
+            // GREEN: all cars move freely
+            for(index = ROAD_LENGTH-1; index > 0; index--)
+            {
+            		vehicle_positions[index] = vehicle_positions[index-1];
+            }
+            vehicle_positions[0] = NO_CAR;
+        }
+        else
+        {
+            // RED or YELLOW
+
+            // AFTER intersection: move intersection + after freely
+        	// Cars at or past the intersection continue moving
+            for(index = ROAD_LENGTH-1; index > STOP_INDEX+1; index--)
+            {
+            	if(index-1 != STOP_INDEX)
+            	{
+            		vehicle_positions[index] = vehicle_positions[index-1];
+            		vehicle_positions[index-1] = NO_CAR;
+            	}
+            }
+
+        	// BEFORE intersection: only move if space ahead is empty
+        	// Cars queue at index 7
+        	for(index = STOP_INDEX; index > 0; index--)
+        	{
+        		if(vehicle_positions[index] == NO_CAR && vehicle_positions[index-1] == CAR_PRESENT)
+        		{
+        			vehicle_positions[index] = vehicle_positions[index-1];
+        			vehicle_positions[index-1] = NO_CAR;
+        		}
+        	}
+
+        }
+
+        // Check for newly generated vehicle
+        vehicle_status = xQueueReceive(VehicleQueue, &vehicle_data, 0); // 0
+
+        if(vehicle_status == pdPASS && vehicle_data == CAR_PRESENT)
+        {
+            vehicle_positions[0] = CAR_PRESENT;
+        }
+
+
+        vTaskDelay(5 * TICK_INTERVAL);
+    }
 }
 
 /*-----------------------------------------------------------*/
 
 // RTOS hook functions (FreeRTOS middleware)
-void vApplicationMallocFailedHook( void )
-{
-	for(;;) { }
-}
+void vApplicationMallocFailedHook( void ) {	for(;;) { } }
 
-void vApplicationStackOverflowHook( xTaskHandle pxTask, signed char *pcTaskName )
-{
+void vApplicationStackOverflowHook( xTaskHandle pxTask, signed char *pcTaskName ){
 	( void ) pcTaskName;
 	( void ) pxTask;
 	for(;;) { }
 }
 
-void vApplicationIdleHook( void )
-{
+void vApplicationIdleHook( void ){
 	volatile size_t available_memory;
 	available_memory = xPortGetFreeHeapSize();
-	
-	if(available_memory > 100)
-	{
-		// Heap monitoring
-	}
+
+	if(available_memory > 100){ /* Heap monitoring */ }
 }
