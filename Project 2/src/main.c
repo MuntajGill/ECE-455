@@ -225,7 +225,7 @@ void vTimerCallback(TimerHandle_t xTimer)
 	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
 	xQueueSendFromISR(xPendingReleaseQueue, &task_num, &xHigherPriorityTaskWoken);
-	vTaskResumeFromISR(xDDTaskGen_handle);
+	xTaskResumeFromISR(xDDTaskGen_handle);
 
 	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
@@ -236,7 +236,7 @@ void vMonitorTimerCallback(TimerHandle_t xTimer)
 {
 	(void)xTimer;  // only one monitor task so no need to check ID
 	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	vTaskResumeFromISR(xMonitor_handle);
+	xTaskResumeFromISR(xMonitor_handle);
 	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
