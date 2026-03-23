@@ -1,26 +1,25 @@
 // Team Member Owen de Groot and Muntaj Gill
-// Student IDs
+// Student IDs: V00962387
+// FULLY WORKING CODE - MINUS SAME TASK TIMING LIMITATION for T1 and T2
 
-/* Standard libraries - no middleware */
+/* RTOS includes - Standard libraries + FreeRTOS middleware */
 #include <stdint.h>
 #include <stdio.h>
 #include "stm32f4_discovery.h"
-
-/* RTOS includes - FreeRTOS middleware */
 #include "stm32f4xx.h"
 #include "../FreeRTOS_Source/include/FreeRTOS.h"
 #include "../FreeRTOS_Source/include/queue.h"
-#include "../FreeRTOS_Source/include/semphr.h"
 #include "../FreeRTOS_Source/include/task.h"
 #include "../FreeRTOS_Source/include/timers.h"
 
 /*-----------------------------------*/
 
-// Task priority levels
-#define HIGH_PRIORITY   3
-#define MEDIUM_PRIORITY 2
-#define LOW_PRIORITY    1
-#define IDLE_PRIORITY   0
+// Four distinct levels so there are no ties between DDS, generator, and user tasks.
+// DDS must always be strictly highest so it pre-empts everything when resumed.
+#define DDS_PRIORITY      4
+#define HIGH_PRIORITY     3   // reserved for EDF winner (not used in step 2)
+#define MEDIUM_PRIORITY   2   // generator
+#define LOW_PRIORITY      1   // future user tasks
 
 /*-----------------------------------*/
 
@@ -31,14 +30,14 @@
 // Hyper-period: 1500ms
 // Utilisation: (95/500) + (150/500) + (250/750) = 0.856 — schedulable
 
-#define T1_EXEC_MS    95
-#define T1_PERIOD_MS  500
-
-#define T2_EXEC_MS    150
-#define T2_PERIOD_MS  500
-
-#define T3_EXEC_MS    250
-#define T3_PERIOD_MS  750
+//#define T1_EXEC_MS    95
+//#define T1_PERIOD_MS  500
+//
+//#define T2_EXEC_MS    150
+//#define T2_PERIOD_MS  500
+//
+//#define T3_EXEC_MS    250
+//#define T3_PERIOD_MS  750
 
 /*-------------- Test Bench #2 ----------------*/
 // Hyper-period: 1500ms
@@ -57,14 +56,14 @@
 // Hyper-period: 500ms
 // Utilisation: (100/500) + (200/500) + (200/500) = 1.0 — boundary case
 
-//#define T1_EXEC_MS    100
-//#define T1_PERIOD_MS  500
-//
-//#define T2_EXEC_MS    200
-//#define T2_PERIOD_MS  500
-//
-//#define T3_EXEC_MS    200
-//#define T3_PERIOD_MS  500
+#define T1_EXEC_MS    100 // 100
+#define T1_PERIOD_MS  500
+
+#define T2_EXEC_MS    200 // 200
+#define T2_PERIOD_MS  500
+
+#define T3_EXEC_MS    200 // 200
+#define T3_PERIOD_MS  500
 
 /*-----------------------------------*/
 
@@ -89,34 +88,40 @@ typedef struct dd_task_list {
 typedef enum {
     RELEASE_TASK,
     COMPLETE_TASK,
-    GET_ACTIVE_LIST,
-    GET_COMPLETED_LIST,
-    GET_OVERDUE_LIST,
-    CHECK_OVERDUE       // sent internally by overdue timer callback
+	GET_ACTIVE_LIST,
+	GET_COMPLETED_LIST,
+	GET_OVERDUE_LIST,
+	CHECK_OVERDUE			// sent internally by overdue timer callback
 } msg_type;
 
 typedef struct {
     msg_type type;
     dd_task  task;
+    QueueHandle_t reply_queue;		// prevents deadlock by stopping acks from being stolen from xResponseQueue
 } dd_message;
 
 /*-----------------------------------*/
 
-// Queue handles
-QueueHandle_t xDDSQueue;            // incoming messages to DDS
-QueueHandle_t xResponseQueue;       // DDS responses
-QueueHandle_t xPendingReleaseQueue; // timer -> generator: which task to release
+// Queue handles - inter-task messaging
+QueueHandle_t xDDSQueue;			// incoming messages to DDS
+//QueueHandle_t xResponseQueue;		// DDS responses
+QueueHandle_t xPendingReleaseQueue;	// timer -> generator: which tasks to release
 
-/*-----------------------------------*/
-
-// Task handles — needed so timer callbacks can resume the right tasks
+// F-Task handles
 TaskHandle_t xDDS_handle;
-TaskHandle_t xDDTaskGen_handle;
+TaskHandle_t xGenerator_handle;
+
+// User-defined tasks
 TaskHandle_t xUserTask1_handle;
 TaskHandle_t xUserTask2_handle;
 TaskHandle_t xUserTask3_handle;
 
-// One timer per user task
+// User-defined task queues - communicating current taskID instance
+QueueHandle_t xTask1IDQueue;
+QueueHandle_t xTask2IDQueue;
+QueueHandle_t xTask3IDQueue;
+
+// Timer handles - one timer per user task
 TimerHandle_t xTimer1;
 TimerHandle_t xTimer2;
 TimerHandle_t xTimer3;
@@ -126,38 +131,24 @@ TimerHandle_t xTimer3;
 TimerHandle_t xMonitorTimer;
 TaskHandle_t  xMonitor_handle;
 
-// Per-task instance counters
-static uint32_t taskID1 = 0;
-static uint32_t taskID2 = 0;
-static uint32_t taskID3 = 0;
+// Per-task instance counter
+static uint32_t task_id = 0;
 
 /*-----------------------------------*/
 
-// F-task declarations
+// Forward declarations F-tasks
 void DDS(void *pvParameters);
 void DD_TaskGenerator(void *pvParameters);
 void Monitor_Task(void *pvParameters);
-void List_Test_Task(void *pvParameters);    // development only — disable before test benches
 
-// User task declarations
+// User-defined task declarations
 void User_Task1(void *pvParameters);
 void User_Task2(void *pvParameters);
 void User_Task3(void *pvParameters);
 
-void vTimerCallback(TimerHandle_t xTimer);
-void vMonitorTimerCallback(TimerHandle_t xTimer);
-
 // DDS interface
 void create_dd_task(TaskHandle_t t_handle, task_type type, uint32_t task_id, uint32_t absolute_deadline);
 void delete_dd_task(uint32_t task_id);
-
-dd_task_list** get_active_dd_task_list(void);
-dd_task_list** get_complete_dd_task_list(void);
-dd_task_list** get_overdue_dd_task_list(void);
-
-void init_FTasks(void);
-
-/*-----------------------------------*/
 
 // List helpers
 dd_task_list* add_task_to_list(dd_task_list **head, dd_task new_task);
@@ -165,53 +156,84 @@ dd_task_list* move_task_between_lists(dd_task_list **src_head, dd_task_list **ds
 dd_task_list* remove_task_from_list(dd_task_list **head, uint32_t task_id);
 dd_task_list* merge_sort_task_list(dd_task_list *head);
 
+// Timer callbacks
+void vTimerCallback(TimerHandle_t xTimer);
+void vMonitorTimerCallback(TimerHandle_t xTimer);
+
+// Monitor task helpers
+dd_task_list* get_active_dd_task_list(void);
+dd_task_list* get_complete_dd_task_list(void);
+dd_task_list* get_overdue_dd_task_list(void);
+
+/*-----------------------------------*/
+
+// Main initializations
+void init_Queues(void);
+void init_FTasks(void);
+void init_MonitorTimer(void);
+
 /*-----------------------------------*/
 
 int main(void)
 {
+	init_Queues();
+
 	init_FTasks();
-	vTaskStartScheduler();
-	for(;;) { }
+
+	init_MonitorTimer();
+
+    vTaskStartScheduler();
+    for (;;) { }
+}
+
+/*-----------------------------------*/
+
+void init_Queues(void)
+{
+	xDDSQueue      = xQueueCreate(10, sizeof(dd_message));
+//	xResponseQueue = xQueueCreate(10, sizeof(uint32_t));
+	xPendingReleaseQueue = xQueueCreate(10, sizeof(uint32_t));
+
+	//TASKID QUEUES
+	xTask1IDQueue = xQueueCreate(5, sizeof(uint32_t));
+	xTask2IDQueue = xQueueCreate(5, sizeof(uint32_t));
+	xTask3IDQueue = xQueueCreate(5, sizeof(uint32_t));
+
 }
 
 /*-----------------------------------*/
 
 void init_FTasks(void)
 {
-	xDDSQueue            = xQueueCreate(10, sizeof(dd_message));
-	xResponseQueue       = xQueueCreate(10, sizeof(dd_task_list*));
-	xPendingReleaseQueue = xQueueCreate(10, sizeof(uint32_t));
+	// User-defined tasks
+	xTaskCreate(User_Task1, "UserTask1", 256, NULL, LOW_PRIORITY, &xUserTask1_handle);
+//	vTaskSuspend(xUserTask1_handle);
+	xTaskCreate(User_Task2, "UserTask2", 256, NULL, LOW_PRIORITY, &xUserTask2_handle);
+//	vTaskSuspend(xUserTask2_handle);
+	xTaskCreate(User_Task3, "UserTask3", 256, NULL, LOW_PRIORITY, &xUserTask3_handle);
+//	vTaskSuspend(xUserTask3_handle);
 
-	xTaskCreate(DDS,             "DDS",       256, NULL, HIGH_PRIORITY,   &xDDS_handle);
-	xTaskCreate(DD_TaskGenerator,"DD_TaskGen",256, NULL, MEDIUM_PRIORITY, &xDDTaskGen_handle);
 	xTaskCreate(Monitor_Task,    "Monitor",   256, NULL, LOW_PRIORITY,    &xMonitor_handle);
 
-	// List_Test_Task is for development only — disable before running test benches
-	// xTaskCreate(List_Test_Task,  "ListTest",  512, NULL, MEDIUM_PRIORITY, NULL);
+	// DDS created first and at highest priority — it will pre-empt
+	// the generator the moment the generator sends a message.
+	xTaskCreate(DD_TaskGenerator, "Generator",256, NULL, MEDIUM_PRIORITY, &xGenerator_handle);
 
-	xTaskCreate(User_Task1, "UserTask1", 256, NULL, LOW_PRIORITY, &xUserTask1_handle);
-	xTaskCreate(User_Task2, "UserTask2", 256, NULL, LOW_PRIORITY, &xUserTask2_handle);
-	xTaskCreate(User_Task3, "UserTask3", 256, NULL, LOW_PRIORITY, &xUserTask3_handle);
-
-	// Suspend everything — timers/DDS will resume as needed
-	vTaskSuspend(xDDS_handle);
-	vTaskSuspend(xDDTaskGen_handle);
-	vTaskSuspend(xMonitor_handle);    // monitor woken by its own timer
-	vTaskSuspend(xUserTask1_handle);
-	vTaskSuspend(xUserTask2_handle);
-	vTaskSuspend(xUserTask3_handle);
+	xTaskCreate(DDS,              "DDS",      512, NULL, DDS_PRIORITY,    &xDDS_handle);
 
 	// Timer ID encodes task number so the shared callback knows which one fired
 	xTimer1 = xTimerCreate("T1_Timer", pdMS_TO_TICKS(T1_PERIOD_MS), pdTRUE, (void*)1, vTimerCallback);
 	xTimer2 = xTimerCreate("T2_Timer", pdMS_TO_TICKS(T2_PERIOD_MS), pdTRUE, (void*)2, vTimerCallback);
 	xTimer3 = xTimerCreate("T3_Timer", pdMS_TO_TICKS(T3_PERIOD_MS), pdTRUE, (void*)3, vTimerCallback);
 
-	xTimerStart(xTimer1, 0);
-	xTimerStart(xTimer2, 0);
-	xTimerStart(xTimer3, 0);
+}
 
+/*-----------------------------------*/
+
+void init_MonitorTimer(void)
+{
 	xMonitorTimer = xTimerCreate("Mon_Timer", pdMS_TO_TICKS(MONITOR_PERIOD_MS),
-	                              pdTRUE, NULL, vMonitorTimerCallback);
+		                              pdTRUE, NULL, vMonitorTimerCallback);
 	xTimerStart(xMonitorTimer, 0);
 }
 
@@ -222,12 +244,9 @@ void init_FTasks(void)
 void vTimerCallback(TimerHandle_t xTimer)
 {
 	uint32_t task_num = (uint32_t)pvTimerGetTimerID(xTimer);
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
-	xQueueSendFromISR(xPendingReleaseQueue, &task_num, &xHigherPriorityTaskWoken);
-	xTaskResumeFromISR(xDDTaskGen_handle);
-
-	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+	xQueueSend(xPendingReleaseQueue, &task_num, 0);
+	vTaskResume(xGenerator_handle);
 }
 
 /*-----------------------------------*/
@@ -235,198 +254,193 @@ void vTimerCallback(TimerHandle_t xTimer)
 void vMonitorTimerCallback(TimerHandle_t xTimer)
 {
 	(void)xTimer;  // only one monitor task so no need to check ID
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	xTaskResumeFromISR(xMonitor_handle);
-	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+	vTaskResume(xMonitor_handle);
 }
+
 
 /*-----------------------------------*/
 
-/* Generator — sleeps until a timer fires, then handles all
-   pending releases before suspending again. */
 void DD_TaskGenerator(void *pvParameters)
 {
-	uint32_t task_num;
 
-	for (;;)
-	{
-		// drain the queue in case multiple timers fired before we ran
-		while (xQueueReceive(xPendingReleaseQueue, &task_num, 0) == pdTRUE)
+		xTimerStart(xTimer1, 0);
+		xTimerStart(xTimer2, 0);
+		xTimerStart(xTimer3, 0);
+
+		uint32_t task_num;
+
+		for (;;)
 		{
-			TickType_t now = xTaskGetTickCount();
+			// drain the queue in case multiple timers fired before we ran
+			while (xQueueReceive(xPendingReleaseQueue, &task_num, 0) == pdTRUE)
+			{
+				TickType_t now = xTaskGetTickCount();
 
-			if (task_num == 1)
-			{
-				taskID1++;
-				uint32_t deadline = now + pdMS_TO_TICKS(T1_PERIOD_MS);
-				printf("[GEN] Task 1 released at %lu, deadline %lu\n",
-					   (unsigned long)now, (unsigned long)deadline);
-				create_dd_task(xUserTask1_handle, PERIODIC, taskID1, deadline);
+				if (task_num == 1)
+				{
+					task_id++;
+					uint32_t deadline = now + pdMS_TO_TICKS(T1_PERIOD_MS);
+					xQueueSend(xTask1IDQueue, &task_id, portMAX_DELAY);					// Pushes TaskID instance to queue
+					create_dd_task(xUserTask1_handle, PERIODIC, task_id, deadline);
+				}
+				else if (task_num == 2)
+				{
+					task_id++;
+					uint32_t deadline = now + pdMS_TO_TICKS(T2_PERIOD_MS);
+					xQueueSend(xTask2IDQueue, &task_id, portMAX_DELAY);
+					create_dd_task(xUserTask2_handle, PERIODIC, task_id, deadline);
+				}
+				else if (task_num == 3)
+				{
+					task_id++;
+					uint32_t deadline = now + pdMS_TO_TICKS(T3_PERIOD_MS);
+					xQueueSend(xTask3IDQueue, &task_id, portMAX_DELAY);
+					create_dd_task(xUserTask3_handle, PERIODIC, task_id, deadline);
+				}
 			}
-			else if (task_num == 2)
-			{
-				taskID2++;
-				uint32_t deadline = now + pdMS_TO_TICKS(T2_PERIOD_MS);
-				printf("[GEN] Task 2 released at %lu, deadline %lu\n",
-					   (unsigned long)now, (unsigned long)deadline);
-				create_dd_task(xUserTask2_handle, PERIODIC, taskID2, deadline);
-			}
-			else if (task_num == 3)
-			{
-				taskID3++;
-				uint32_t deadline = now + pdMS_TO_TICKS(T3_PERIOD_MS);
-				printf("[GEN] Task 3 released at %lu, deadline %lu\n",
-					   (unsigned long)now, (unsigned long)deadline);
-				create_dd_task(xUserTask3_handle, PERIODIC, taskID3, deadline);
-			}
+			vTaskSuspend(NULL);
 		}
-
-		vTaskSuspend(NULL);
-	}
 }
 
 /*-----------------------------------*/
 
 /* DDS — blocks on xDDSQueue waiting for messages from the interface functions.
    Manages active, completed, and overdue lists internally.
-   EDF is applied by setting the earliest-deadline task to HIGH-1 priority
+   EDF is applied by setting the earliest-deadline task to HIGH priority
    and everything else to LOW after any list change. */
 void DDS(void *pvParameters)
 {
-	dd_task_list *active_list    = NULL;
-	dd_task_list *completed_list = NULL;
-	dd_task_list *overdue_list   = NULL;
+    dd_task_list *active_list = NULL;
+    dd_task_list *completed_list = NULL;
+    dd_task_list *overdue_list = NULL;
 
-	dd_message msg;
-	uint32_t   ack = 1;
+    dd_message msg;
+    uint32_t   ack = 1;
 
-	for (;;)
-	{
-		if (xQueueReceive(xDDSQueue, &msg, portMAX_DELAY) != pdTRUE)
-			continue;
+    for (;;)
+    {
+        // Block until a message arrives (put here after first resume)
+        xQueueReceive(xDDSQueue, &msg, portMAX_DELAY);
 
-		TickType_t now = xTaskGetTickCount();
+        TickType_t now = xTaskGetTickCount();
 
-		switch (msg.type)
-		{
-			case RELEASE_TASK:
-			{
-				msg.task.release_time = (uint32_t)now;
+        switch (msg.type)
+        {
+            	case RELEASE_TASK:
+            	{
+            			msg.task.release_time = (uint32_t)now;
 
-				// Suspend current head before reordering
-				if (active_list != NULL)
-				{
-					vTaskSuspend(active_list->task.t_handle);
-					vTaskPrioritySet(active_list->task.t_handle, LOW_PRIORITY);
-				}
+            			// Suspend and demote current EDF head before reordering
+//            			if (active_list != NULL)
+//            			{
+//            					vTaskSuspend(active_list->task.t_handle);
+//            					vTaskPrioritySet(active_list->task.t_handle, LOW_PRIORITY);
+//            			}
 
-				add_task_to_list(&active_list, msg.task);
-				active_list = merge_sort_task_list(active_list);
+            			add_task_to_list(&active_list, msg.task);
+            			active_list = merge_sort_task_list(active_list);
 
-				// Apply EDF priorities
-				dd_task_list *curr = active_list;
-				int first = 1;
-				while (curr != NULL)
-				{
-					if (first)
-					{
-						vTaskPrioritySet(curr->task.t_handle, HIGH_PRIORITY - 1);
-						vTaskResume(curr->task.t_handle);
-						first = 0;
-					}
-					else
-					{
-						vTaskPrioritySet(curr->task.t_handle, LOW_PRIORITY);
-					}
-					curr = curr->next_task;
-				}
+            			// Apply EDF priorities - head = HIGH_PRIORITY, rest get LOW_PRIORITY
+            			dd_task_list *curr = active_list;
+            			int first = 1;
+            			while (curr != NULL)
+            			{
+            					if (first)
+            					{
+            							vTaskPrioritySet(curr->task.t_handle, HIGH_PRIORITY);
+            							vTaskResume(curr->task.t_handle);
+            							first = 0;
+            					}
+            					else
+            					{
+            							vTaskPrioritySet(curr->task.t_handle, LOW_PRIORITY);
+            							vTaskResume(curr->task.t_handle);
+            					}
+            					curr = curr->next_task;
+            			}
 
-				xQueueSend(xResponseQueue, &ack, portMAX_DELAY);
-				break;
-			}
+            			printf("[R] ID=%u t=%u\n",
+            					(unsigned int)msg.task.task_id,
+								(unsigned int)now);
 
-			case COMPLETE_TASK:
-			{
-				// Find the completing task and stamp its completion time
-				dd_task_list *completing = active_list;
-				while (completing != NULL)
-				{
-					if (completing->task.task_id == msg.task.task_id)
-					{
-						vTaskSuspend(completing->task.t_handle);
-						vTaskPrioritySet(completing->task.t_handle, LOW_PRIORITY);
-						completing->task.completion_time = (uint32_t)now;
-						break;
-					}
-					completing = completing->next_task;
-				}
+            			xQueueSend(msg.reply_queue, &ack, portMAX_DELAY);
+            			break;
+            	}
 
-				if (completing != NULL)
-				{
-					if (completing->task.completion_time <= completing->task.absolute_deadline)
-						move_task_between_lists(&active_list, &completed_list, msg.task.task_id);
-					else
-						move_task_between_lists(&active_list, &overdue_list, msg.task.task_id);
-				}
+            	case COMPLETE_TASK:
+            	{
+            			// Find the completing task and stamp its completion time
+            			dd_task_list *complete = active_list;
+            			while (complete != NULL)
+            			{
+            					if (complete->task.task_id == msg.task.task_id)
+            					{
+            							vTaskSuspend(complete->task.t_handle);
+            							vTaskPrioritySet(complete->task.t_handle, LOW_PRIORITY);
+            							complete->task.completion_time = (uint32_t)now;
+            							break;
+            					}
+            					complete = complete->next_task;
+            			}
 
-				active_list = merge_sort_task_list(active_list);
+            			// STEP 5 - move to overdue list
+            			if (complete != NULL)
+            			{
+            				if (complete->task.completion_time <= complete->task.absolute_deadline)
+            				{
+            					move_task_between_lists(&active_list, &completed_list, msg.task.task_id);
+            					printf("[C] ID=%u t=%u\n", (unsigned int)msg.task.task_id, (unsigned int)now);
+            				}
+            				else
+            				{
+            					move_task_between_lists(&active_list, &overdue_list, msg.task.task_id);
+            					printf("[OD] ID=%u t=%u\n", (unsigned int)msg.task.task_id, (unsigned int)now);
+            				}
+            			}
 
-				// Re-apply EDF to remaining tasks
-				dd_task_list *curr = active_list;
-				int first = 1;
-				while (curr != NULL)
-				{
-					if (first)
-					{
-						vTaskPrioritySet(curr->task.t_handle, HIGH_PRIORITY - 1);
-						vTaskResume(curr->task.t_handle);
-						first = 0;
-					}
-					else
-					{
-						vTaskPrioritySet(curr->task.t_handle, LOW_PRIORITY);
-					}
-					curr = curr->next_task;
-				}
+            			active_list = merge_sort_task_list(active_list);
 
-				xQueueSend(xResponseQueue, &ack, portMAX_DELAY);
-				break;
-			}
+            			// Re-apply EDF to remaining tasks
+            			dd_task_list *curr = active_list;
+            			int first = 1;
+            			while (curr != NULL)
+            			{
+            					if (first)
+            					{
+            							vTaskPrioritySet(curr->task.t_handle, HIGH_PRIORITY);
+            							vTaskResume(curr->task.t_handle);
+            							first = 0;
+            					}
+            					else
+            					{
+            							vTaskPrioritySet(curr->task.t_handle, LOW_PRIORITY);
+            							vTaskResume(curr->task.t_handle);
+            					}
+            					curr = curr->next_task;
+            			}
 
-			// Return list head pointer directly — no separate ack needed
-			case GET_ACTIVE_LIST:
-				xQueueSend(xResponseQueue, &active_list, portMAX_DELAY);
-				break;
+            			xQueueSend(msg.reply_queue, &ack, portMAX_DELAY);
+            			break;
+            	}
 
-			case GET_COMPLETED_LIST:
-				xQueueSend(xResponseQueue, &completed_list, portMAX_DELAY);
-				break;
+            	case GET_ACTIVE_LIST:
+            		xQueueSend(msg.reply_queue, &active_list, portMAX_DELAY);
+            		break;
 
-			case GET_OVERDUE_LIST:
-				xQueueSend(xResponseQueue, &overdue_list, portMAX_DELAY);
-				break;
+            	case GET_COMPLETED_LIST:
+            		xQueueSend(msg.reply_queue, &completed_list, portMAX_DELAY);
+            		break;
 
-			case CHECK_OVERDUE:
-			{
-				dd_task_list *curr = active_list;
-				while (curr != NULL)
-				{
-					dd_task_list *next = curr->next_task;
-					if ((uint32_t)now > curr->task.absolute_deadline)
-					{
-						curr->task.completion_time = (uint32_t)now;
-						add_task_to_list(&overdue_list, curr->task);
-						remove_task_from_list(&active_list, curr->task.task_id);
-						active_list = merge_sort_task_list(active_list);
-					}
-					curr = next;
-				}
-				break;
-			}
+            	case GET_OVERDUE_LIST:
+            		xQueueSend(msg.reply_queue, &overdue_list, portMAX_DELAY);
+            		break;
 
-			default:
-				break;
-		}
+            	default:
+            		break;
+        	}
+
+        	// Suspend until the next interface call resumes us
+        	vTaskSuspend(NULL);
 	}
 }
 
@@ -437,25 +451,24 @@ void Monitor_Task(void *pvParameters)
 {
 	for (;;)
 	{
-		TickType_t now = xTaskGetTickCount();
 
-		dd_task_list **active    = get_active_dd_task_list();
-		dd_task_list **completed = get_complete_dd_task_list();
-		dd_task_list **overdue   = get_overdue_dd_task_list();
+		dd_task_list *active    = get_active_dd_task_list();
+		dd_task_list *completed = get_complete_dd_task_list();
+		dd_task_list *overdue   = get_overdue_dd_task_list();
 
 		int active_count = 0, completed_count = 0, overdue_count = 0;
 
-		dd_task_list *curr = (active    ? *active    : NULL);
-		while (curr) { active_count++;    curr = curr->next_task; }
+		dd_task_list *curr = active;
+		while (curr != NULL) { active_count++;    curr = curr->next_task; }
 
-		curr = (completed ? *completed : NULL);
-		while (curr) { completed_count++; curr = curr->next_task; }
+		curr = completed;
+		while (curr != NULL) { completed_count++; curr = curr->next_task; }
 
-		curr = (overdue   ? *overdue   : NULL);
-		while (curr) { overdue_count++;   curr = curr->next_task; }
+		curr = overdue;
+		while (curr != NULL) { overdue_count++;   curr = curr->next_task; }
 
-		printf("[MONITOR] t=%lu ms | Active: %d | Completed: %d | Overdue: %d\n",
-		       (unsigned long)now,
+		printf("[MON] t=%u | A=%d | C=%d | OD=%d\n",
+		       (unsigned long)xTaskGetTickCount(),
 		       active_count, completed_count, overdue_count);
 
 		vTaskSuspend(NULL);
@@ -464,18 +477,20 @@ void Monitor_Task(void *pvParameters)
 
 /*-----------------------------------*/
 
-// User tasks — busy-wait to simulate workload, then signal completion to DDS.
-// The for(;;) re-enters only after DDS resumes this task for a new instance.
-
 void User_Task1(void *pvParameters)
 {
 	for (;;)
 	{
+		uint32_t my_id;
+		xQueueReceive(xTask1IDQueue, &my_id, portMAX_DELAY);
+
 		TickType_t start = xTaskGetTickCount();
 		while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(T1_EXEC_MS)) { }
 
-		printf("[T1] Complete at %lu ms\n", (unsigned long)xTaskGetTickCount());
-		delete_dd_task(taskID1);
+		printf("[T1] t=%u\n", (unsigned long)xTaskGetTickCount());
+		delete_dd_task(my_id);
+
+		vTaskSuspend(NULL);
 	}
 }
 
@@ -485,11 +500,16 @@ void User_Task2(void *pvParameters)
 {
 	for (;;)
 	{
+		uint32_t my_id;
+		xQueueReceive(xTask2IDQueue, &my_id, portMAX_DELAY);
+
 		TickType_t start = xTaskGetTickCount();
 		while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(T2_EXEC_MS)) { }
 
-		printf("[T2] Complete at %lu ms\n", (unsigned long)xTaskGetTickCount());
-		delete_dd_task(taskID2);
+		printf("[T2] t=%u\n", (unsigned long)xTaskGetTickCount());
+		delete_dd_task(my_id);
+
+		vTaskSuspend(NULL);
 	}
 }
 
@@ -499,37 +519,52 @@ void User_Task3(void *pvParameters)
 {
 	for (;;)
 	{
+		uint32_t my_id;
+		xQueueReceive(xTask3IDQueue, &my_id, portMAX_DELAY);
+
 		TickType_t start = xTaskGetTickCount();
 		while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(T3_EXEC_MS)) { }
 
-		printf("[T3] Complete at %lu ms\n", (unsigned long)xTaskGetTickCount());
-		delete_dd_task(taskID3);
+		printf("[T3] t=%u\n", (unsigned long)xTaskGetTickCount());
+		delete_dd_task(my_id);
+
+		vTaskSuspend(NULL);
 	}
 }
 
 /*-----------------------------------*/
 
-/* Sends RELEASE_TASK to DDS and blocks until ack comes back. */
+// Sends RELEASE_TASK to DDS, resumes it, then blocks waiting for the ack.
+// Pattern: caller resumes DDS, DDS
+// pre-empts immediately (it's highest priority), processes, sends ack,
+// suspends itself, then caller unblocks and returns.
 void create_dd_task(TaskHandle_t t_handle, task_type type,
                     uint32_t task_id, uint32_t absolute_deadline)
 {
-	dd_task task;
-	task.t_handle          = t_handle;
-	task.type              = type;
-	task.task_id           = task_id;
-	task.release_time      = 0;  // DDS stamps this
-	task.absolute_deadline = absolute_deadline;
-	task.completion_time   = 0;
+	QueueHandle_t reply_q = xQueueCreate(1, sizeof(uint32_t));
 
-	dd_message message;
-	message.type = RELEASE_TASK;
-	message.task = task;
+    dd_task task;
+    task.t_handle          = t_handle;
+    task.type              = type;
+    task.task_id           = task_id;
+    task.release_time      = 0;   // DDS stamps this
+    task.absolute_deadline = absolute_deadline;
+    task.completion_time   = 0;
 
-	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
-	vTaskResume(xDDS_handle);
+    dd_message message;
+    message.type = RELEASE_TASK;
+    message.task = task;
 
-	uint32_t ack;
-	xQueueReceive(xResponseQueue, &ack, portMAX_DELAY);
+    message.reply_queue = reply_q;
+
+    xQueueSend(xDDSQueue, &message, portMAX_DELAY);
+    vTaskResume(xDDS_handle);     // wake DDS — it pre-empts us immediately
+
+    uint32_t ack;
+    xQueueReceive(reply_q, &ack, portMAX_DELAY);
+    vQueueDelete(reply_q);
+    // Returns here after DDS has processed the message and suspended itself
+
 }
 
 /*-----------------------------------*/
@@ -538,6 +573,8 @@ void create_dd_task(TaskHandle_t t_handle, task_type type,
    Note: do NOT suspend here — DDS handles suspend/resume ordering itself. */
 void delete_dd_task(uint32_t task_id)
 {
+	QueueHandle_t reply_q = xQueueCreate(1, sizeof(uint32_t));
+
 	dd_task task;
 	task.t_handle          = NULL;
 	task.type              = PERIODIC;  // not used by DDS on completion
@@ -550,288 +587,108 @@ void delete_dd_task(uint32_t task_id)
 	message.type = COMPLETE_TASK;
 	message.task = task;
 
+	message.reply_queue = reply_q;
+
 	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
 	vTaskResume(xDDS_handle);
 
 	uint32_t ack;
-	xQueueReceive(xResponseQueue, &ack, portMAX_DELAY);
+	xQueueReceive(reply_q, &ack, portMAX_DELAY);
 
-	// don't suspend here — would race with DDS's own vTaskResume call
+	vQueueDelete(reply_q);
+
+
+	// don't suspend here - would race with DDS's own vTaskResume call
 }
+
 
 /*-----------------------------------*/
 
-dd_task_list** get_active_dd_task_list(void)
+dd_task_list* get_active_dd_task_list(void)
 {
+	QueueHandle_t reply_q = xQueueCreate(1, sizeof(dd_task_list*));
+
 	dd_message message;
 	message.type = GET_ACTIVE_LIST;
+	message.reply_queue = reply_q;
 
 	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
 	vTaskResume(xDDS_handle);
 
-	static dd_task_list *result;
-	xQueueReceive(xResponseQueue, &result, portMAX_DELAY);
-	return &result;
+	dd_task_list *result;
+	xQueueReceive(reply_q, &result, portMAX_DELAY);
+	vQueueDelete(reply_q);
+
+	return result;
 }
 
 /*-----------------------------------*/
 
-dd_task_list** get_complete_dd_task_list(void)
+dd_task_list* get_complete_dd_task_list(void)
 {
+	QueueHandle_t reply_q = xQueueCreate(1, sizeof(dd_task_list*));
+
 	dd_message message;
 	message.type = GET_COMPLETED_LIST;
+	message.reply_queue = reply_q;
 
 	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
 	vTaskResume(xDDS_handle);
 
-	static dd_task_list *result;
-	xQueueReceive(xResponseQueue, &result, portMAX_DELAY);
-	return &result;
+	dd_task_list *result;
+	xQueueReceive(reply_q, &result, portMAX_DELAY);
+	vQueueDelete(reply_q);
+
+	return result;
 }
 
 /*-----------------------------------*/
 
-dd_task_list** get_overdue_dd_task_list(void)
+dd_task_list* get_overdue_dd_task_list(void)
 {
+	QueueHandle_t reply_q = xQueueCreate(1, sizeof(dd_task_list*));
+
 	dd_message message;
 	message.type = GET_OVERDUE_LIST;
+	message.reply_queue = reply_q;
 
 	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
 	vTaskResume(xDDS_handle);
 
-	static dd_task_list *result;
-	xQueueReceive(xResponseQueue, &result, portMAX_DELAY);
-	return &result;
+	dd_task_list *result;
+	xQueueReceive(reply_q, &result, portMAX_DELAY);
+	vQueueDelete(reply_q);
+
+	return result;
 }
 
 /*-----------------------------------*/
 
-/* Standalone list test — runs once at startup then suspends.
-   Uses Test Bench #1 deadlines to verify add, sort, and remove. */
-void List_Test_Task(void *pvParameters)
-{
-	dd_task_list *test_list = NULL;
-	dd_task_list *curr      = NULL;
-	int pass                = 1;
-
-	printf("\n========================================\n");
-	printf("  DD-Task List Function Tests\n");
-	printf("  Based on Test Bench #1 (T1=500ms, T2=500ms, T3=750ms)\n");
-	printf("========================================\n\n");
-
-	// deadlines match the first hyper-period of Test Bench #1
-	dd_task task1 = {
-		.t_handle          = NULL,
-		.type              = PERIODIC,
-		.task_id           = 1,
-		.release_time      = 0,
-		.absolute_deadline = pdMS_TO_TICKS(500),
-		.completion_time   = 0
-	};
-
-	dd_task task2 = {
-		.t_handle          = NULL,
-		.type              = PERIODIC,
-		.task_id           = 2,
-		.release_time      = 0,
-		.absolute_deadline = pdMS_TO_TICKS(500),   // same deadline as T1
-		.completion_time   = 0
-	};
-
-	dd_task task3 = {
-		.t_handle          = NULL,
-		.type              = PERIODIC,
-		.task_id           = 3,
-		.release_time      = 0,
-		.absolute_deadline = pdMS_TO_TICKS(750),
-		.completion_time   = 0
-	};
-
-	// TEST 1: add three tasks, check count and insertion order
-	printf("--- TEST 1: add_task_to_list ---\n");
-
-	add_task_to_list(&test_list, task3);  // intentionally out of deadline order
-	add_task_to_list(&test_list, task1);
-	add_task_to_list(&test_list, task2);
-
-	int count = 0;
-	curr = test_list;
-	while (curr != NULL) { count++; curr = curr->next_task; }
-
-	if (count == 3)
-		printf("  [PASS] List has 3 nodes after 3 adds\n");
-	else {
-		printf("  [FAIL] Expected 3 nodes, got %d\n", count);
-		pass = 0;
-	}
-
-	if (test_list != NULL &&
-	    test_list->task.task_id == 3 &&
-	    test_list->next_task->task.task_id == 1 &&
-	    test_list->next_task->next_task->task.task_id == 2)
-		printf("  [PASS] Insertion order preserved (3 -> 1 -> 2)\n");
-	else {
-		printf("  [FAIL] Insertion order wrong\n");
-		pass = 0;
-	}
-
-	printf("  List contents: ");
-	curr = test_list;
-	while (curr != NULL) {
-		printf("ID=%lu(dl=%lu) ", (unsigned long)curr->task.task_id,
-		       (unsigned long)curr->task.absolute_deadline);
-		curr = curr->next_task;
-	}
-	printf("\n\n");
-
-	// TEST 2: sort — task3 (dl=750) should end up last
-	printf("--- TEST 2: merge_sort_task_list ---\n");
-
-	test_list = merge_sort_task_list(test_list);
-
-	// first two nodes must have deadline 500, last must have 750
-	int sort_pass = 1;
-	curr = test_list;
-	if (curr == NULL || curr->task.absolute_deadline != pdMS_TO_TICKS(500)) sort_pass = 0;
-	else curr = curr->next_task;
-	if (curr == NULL || curr->task.absolute_deadline != pdMS_TO_TICKS(500)) sort_pass = 0;
-	else curr = curr->next_task;
-	if (curr == NULL || curr->task.absolute_deadline != pdMS_TO_TICKS(750)) sort_pass = 0;
-
-	if (sort_pass)
-		printf("  [PASS] Sorted by deadline: 500 -> 500 -> 750\n");
-	else {
-		printf("  [FAIL] Sort order incorrect\n");
-		pass = 0;
-	}
-
-	printf("  Sorted list: ");
-	curr = test_list;
-	while (curr != NULL) {
-		printf("ID=%lu(dl=%lu) ", (unsigned long)curr->task.task_id,
-		       (unsigned long)curr->task.absolute_deadline);
-		curr = curr->next_task;
-	}
-	printf("\n\n");
-
-	// TEST 3: remove middle node
-	printf("--- TEST 3: remove_task_from_list (middle node) ---\n");
-
-	uint32_t mid_id = test_list->next_task->task.task_id;
-	test_list = remove_task_from_list(&test_list, mid_id);
-
-	count = 0;
-	curr = test_list;
-	int found_removed = 0;
-	while (curr != NULL) {
-		if (curr->task.task_id == mid_id) found_removed = 1;
-		count++;
-		curr = curr->next_task;
-	}
-
-	if (count == 2 && !found_removed)
-		printf("  [PASS] Removed ID=%lu, list now has 2 nodes\n", (unsigned long)mid_id);
-	else {
-		printf("  [FAIL] Remove middle failed (count=%d, still_present=%d)\n", count, found_removed);
-		pass = 0;
-	}
-
-	// TEST 4: remove head
-	printf("--- TEST 4: remove_task_from_list (head node) ---\n");
-
-	uint32_t head_id = test_list->task.task_id;
-	test_list = remove_task_from_list(&test_list, head_id);
-
-	count = 0;
-	found_removed = 0;
-	curr = test_list;
-	while (curr != NULL) {
-		if (curr->task.task_id == head_id) found_removed = 1;
-		count++;
-		curr = curr->next_task;
-	}
-
-	if (count == 1 && !found_removed)
-		printf("  [PASS] Removed head ID=%lu, list now has 1 node\n", (unsigned long)head_id);
-	else {
-		printf("  [FAIL] Remove head failed (count=%d, still_present=%d)\n", count, found_removed);
-		pass = 0;
-	}
-
-	// TEST 5: remove last node — list should be NULL
-	printf("--- TEST 5: remove_task_from_list (last node -> empty list) ---\n");
-
-	uint32_t last_id = test_list->task.task_id;
-	test_list = remove_task_from_list(&test_list, last_id);
-
-	if (test_list == NULL)
-		printf("  [PASS] List is NULL after removing last node\n");
-	else {
-		printf("  [FAIL] List should be NULL but is not\n");
-		pass = 0;
-	}
-
-	// TEST 6: remove from empty list — should not crash
-	printf("--- TEST 6: remove_task_from_list (empty list, no crash) ---\n");
-
-	test_list = remove_task_from_list(&test_list, 99);
-
-	if (test_list == NULL)
-		printf("  [PASS] Returned NULL gracefully on empty list\n");
-	else {
-		printf("  [FAIL] Should return NULL on empty list\n");
-		pass = 0;
-	}
-
-	// TEST 7: single node sort
-	printf("--- TEST 7: merge_sort_task_list (single node) ---\n");
-
-	add_task_to_list(&test_list, task2);
-	test_list = merge_sort_task_list(test_list);
-
-	if (test_list != NULL && test_list->task.task_id == task2.task_id && test_list->next_task == NULL)
-		printf("  [PASS] Single-node sort returned correct node\n");
-	else {
-		printf("  [FAIL] Single-node sort failed\n");
-		pass = 0;
-	}
-
-	remove_task_from_list(&test_list, task2.task_id);
-
-	printf("\n========================================\n");
-	if (pass)
-		printf("  ALL TESTS PASSED\n");
-	else
-		printf("  ONE OR MORE TESTS FAILED — see above\n");
-	printf("========================================\n\n");
-
-	vTaskSuspend(NULL);
-}
-
-/*-----------------------------------*/
-
-/* Appends a new node to the list. Sorting is done separately.
-   Uses pvPortMalloc — only called once per task instance at release. */
+// Appends a new node to the tail of the list.
 dd_task_list* add_task_to_list(dd_task_list **head, dd_task new_task)
 {
-	dd_task_list *node = (dd_task_list*)pvPortMalloc(sizeof(dd_task_list));
-	if (node == NULL) return *head;  // alloc failed
+    dd_task_list *node = (dd_task_list*)pvPortMalloc(sizeof(dd_task_list));
+    if (node == NULL)
+    {
+        printf("[ERROR] pvPortMalloc failed in add_task_to_list\n");
+        return *head;
+    }
 
-	node->task      = new_task;
-	node->next_task = NULL;
+    node->task      = new_task;
+    node->next_task = NULL;
 
-	if (*head == NULL)
-	{
-		*head = node;
-		return *head;
-	}
+    if (*head == NULL)
+    {
+        *head = node;
+        return *head;
+    }
 
-	dd_task_list *curr = *head;
-	while (curr->next_task != NULL)
-		curr = curr->next_task;
+    dd_task_list *curr = *head;
+    while (curr->next_task != NULL)
+        curr = curr->next_task;
 
-	curr->next_task = node;
-	return *head;
+    curr->next_task = node;
+    return *head;
 }
 
 /*-----------------------------------*/
@@ -991,16 +848,18 @@ dd_task_list* merge_sort_task_list(dd_task_list *head)
 
 /*-----------------------------------*/
 
-void vApplicationMallocFailedHook( void ) { for(;;) { } }
+void vApplicationMallocFailedHook(void) { for (;;) { } }
 
-void vApplicationStackOverflowHook( xTaskHandle pxTask, signed char *pcTaskName ){
-	( void ) pcTaskName;
-	( void ) pxTask;
-	for(;;) { }
+void vApplicationStackOverflowHook(xTaskHandle pxTask, signed char *pcTaskName)
+{
+    (void)pcTaskName;
+    (void)pxTask;
+    for (;;) { }
 }
 
-void vApplicationIdleHook( void ){
-	volatile size_t available_memory;
-	available_memory = xPortGetFreeHeapSize();
-	if(available_memory > 100){ /* heap ok */ }
+void vApplicationIdleHook(void)
+{
+    volatile size_t available_memory;
+    available_memory = xPortGetFreeHeapSize();
+    if (available_memory > 100) { /* heap ok */ }
 }
