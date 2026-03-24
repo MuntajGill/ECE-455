@@ -354,7 +354,7 @@ void DDS(void *pvParameters)
             					else
             					{
             							vTaskPrioritySet(curr->task.t_handle, LOW_PRIORITY);
-            							vTaskResume(curr->task.t_handle);
+            							// vTaskResume(curr->task.t_handle);
             					}
             					curr = curr->next_task;
             			}
@@ -376,7 +376,7 @@ void DDS(void *pvParameters)
             					if (complete->task.task_id == msg.task.task_id)
             					{
             							vTaskSuspend(complete->task.t_handle);
-            							vTaskPrioritySet(complete->task.t_handle, LOW_PRIORITY);
+            							// vTaskPrioritySet(complete->task.t_handle, LOW_PRIORITY);
             							complete->task.completion_time = (uint32_t)now;
             							break;
             					}
@@ -414,7 +414,7 @@ void DDS(void *pvParameters)
             					else
             					{
             							vTaskPrioritySet(curr->task.t_handle, LOW_PRIORITY);
-            							vTaskResume(curr->task.t_handle);
+            							// vTaskResume(curr->task.t_handle);
             					}
             					curr = curr->next_task;
             			}
@@ -490,7 +490,7 @@ void User_Task1(void *pvParameters)
 		printf("[T1] t=%u\n", (unsigned long)xTaskGetTickCount());
 		delete_dd_task(my_id);
 
-		vTaskSuspend(NULL);
+		// vTaskSuspend(NULL);
 	}
 }
 
@@ -509,7 +509,7 @@ void User_Task2(void *pvParameters)
 		printf("[T2] t=%u\n", (unsigned long)xTaskGetTickCount());
 		delete_dd_task(my_id);
 
-		vTaskSuspend(NULL);
+		// vTaskSuspend(NULL);
 	}
 }
 
@@ -528,7 +528,7 @@ void User_Task3(void *pvParameters)
 		printf("[T3] t=%u\n", (unsigned long)xTaskGetTickCount());
 		delete_dd_task(my_id);
 
-		vTaskSuspend(NULL);
+		// vTaskSuspend(NULL);
 	}
 }
 
