@@ -21,14 +21,20 @@
 #define MEDIUM_PRIORITY   2   // generator
 #define LOW_PRIORITY      1   // future user tasks
 
+// LED colour assignments - one per user task so the board visually
+// indicates which task the EDF scheduler is currently executing.
+#define LED_T1  LED4   // green - Task 1
+#define LED_T2  LED5   // red   - Task 2
+#define LED_T3  LED6   // blue  - Task 3
+
 /*-----------------------------------*/
 
-// Test Bench Selection — uncomment ONE bench at a time.
+// Test Bench Selection - uncomment ONE bench at a time.
 // Comment out the other two before building.
 
 /*-------------- Test Bench #1 ----------------*/
 // Hyper-period: 1500ms
-// Utilisation: (95/500) + (150/500) + (250/750) = 0.856 — schedulable
+// Utilisation: (95/500) + (150/500) + (250/750) = 0.856 - schedulable
 
 //#define T1_EXEC_MS    95
 //#define T1_PERIOD_MS  500
@@ -41,7 +47,7 @@
 
 /*-------------- Test Bench #2 ----------------*/
 // Hyper-period: 1500ms
-// Utilisation: (95/250) + (150/500) + (250/750) = 0.713 — schedulable
+// Utilisation: (95/250) + (150/500) + (250/750) = 0.713 - schedulable
 
 //#define T1_EXEC_MS    95
 //#define T1_PERIOD_MS  250
@@ -54,7 +60,7 @@
 
 /*-------------- Test Bench #3 ----------------*/
 // Hyper-period: 500ms
-// Utilisation: (100/500) + (200/500) + (200/500) = 1.0 — boundary case
+// Utilisation: (100/500) + (200/500) + (200/500) = 1.0 - boundary case
 
 #define T1_EXEC_MS    100 // 100
 #define T1_PERIOD_MS  500
@@ -176,6 +182,19 @@ void init_MonitorTimer(void);
 
 int main(void)
 {
+	// Initialise all LEDs before the scheduler starts - configures GPIO clocks
+	// so STM_EVAL_LEDOn/Off calls inside user tasks hit initialised hardware.
+	STM_EVAL_LEDInit(LED3);
+	STM_EVAL_LEDInit(LED_T1);
+	STM_EVAL_LEDInit(LED_T2);
+	STM_EVAL_LEDInit(LED_T3);
+	
+	// Ensure all LEDs start in the OFF state at boot.
+	STM_EVAL_LEDOff(LED3);
+	STM_EVAL_LEDOff(LED_T1);
+	STM_EVAL_LEDOff(LED_T2);
+	STM_EVAL_LEDOff(LED_T3);
+	
 	init_Queues();
 
 	init_FTasks();
@@ -215,7 +234,7 @@ void init_FTasks(void)
 
 	xTaskCreate(Monitor_Task,    "Monitor",   256, NULL, LOW_PRIORITY,    &xMonitor_handle);
 
-	// DDS created first and at highest priority — it will pre-empt
+	// DDS created first and at highest priority - it will pre-empt
 	// the generator the moment the generator sends a message.
 	xTaskCreate(DD_TaskGenerator, "Generator",256, NULL, MEDIUM_PRIORITY, &xGenerator_handle);
 
@@ -239,7 +258,7 @@ void init_MonitorTimer(void)
 
 /*-----------------------------------*/
 
-/* Shared timer callback — runs in timer daemon context.
+/* Shared timer callback - runs in timer daemon context.
    Pushes task number to queue and wakes the generator. */
 void vTimerCallback(TimerHandle_t xTimer)
 {
@@ -304,7 +323,7 @@ void DD_TaskGenerator(void *pvParameters)
 
 /*-----------------------------------*/
 
-/* DDS — blocks on xDDSQueue waiting for messages from the interface functions.
+/* DDS - blocks on xDDSQueue waiting for messages from the interface functions.
    Manages active, completed, and overdue lists internally.
    EDF is applied by setting the earliest-deadline task to HIGH priority
    and everything else to LOW after any list change. */
@@ -483,11 +502,13 @@ void User_Task1(void *pvParameters)
 	{
 		uint32_t my_id;
 		xQueueReceive(xTask1IDQueue, &my_id, portMAX_DELAY);
+		STM_EVAL_LEDOn(LED_T1);
 
 		TickType_t start = xTaskGetTickCount();
 		while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(T1_EXEC_MS)) { }
 
 		printf("[T1] t=%u\n", (unsigned long)xTaskGetTickCount());
+		STM_EVAL_LEDOff(LED_T1);
 		delete_dd_task(my_id);
 
 		// vTaskSuspend(NULL);
@@ -502,11 +523,13 @@ void User_Task2(void *pvParameters)
 	{
 		uint32_t my_id;
 		xQueueReceive(xTask2IDQueue, &my_id, portMAX_DELAY);
+		STM_EVAL_LEDOn(LED_T2);
 
 		TickType_t start = xTaskGetTickCount();
 		while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(T2_EXEC_MS)) { }
 
 		printf("[T2] t=%u\n", (unsigned long)xTaskGetTickCount());
+		STM_EVAL_LEDOff(LED_T2);
 		delete_dd_task(my_id);
 
 		// vTaskSuspend(NULL);
@@ -521,11 +544,13 @@ void User_Task3(void *pvParameters)
 	{
 		uint32_t my_id;
 		xQueueReceive(xTask3IDQueue, &my_id, portMAX_DELAY);
+		STM_EVAL_LEDOn(LED_T3);
 
 		TickType_t start = xTaskGetTickCount();
 		while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(T3_EXEC_MS)) { }
 
 		printf("[T3] t=%u\n", (unsigned long)xTaskGetTickCount());
+		STM_EVAL_LEDOff(LED_T3);
 		delete_dd_task(my_id);
 
 		// vTaskSuspend(NULL);
@@ -558,7 +583,7 @@ void create_dd_task(TaskHandle_t t_handle, task_type type,
     message.reply_queue = reply_q;
 
     xQueueSend(xDDSQueue, &message, portMAX_DELAY);
-    vTaskResume(xDDS_handle);     // wake DDS — it pre-empts us immediately
+    vTaskResume(xDDS_handle);     // wake DDS - it pre-empts us immediately
 
     uint32_t ack;
     xQueueReceive(reply_q, &ack, portMAX_DELAY);
@@ -570,7 +595,7 @@ void create_dd_task(TaskHandle_t t_handle, task_type type,
 /*-----------------------------------*/
 
 /* Sends COMPLETE_TASK to DDS, waits for ack.
-   Note: do NOT suspend here — DDS handles suspend/resume ordering itself. */
+   Note: do NOT suspend here - DDS handles suspend/resume ordering itself. */
 void delete_dd_task(uint32_t task_id)
 {
 	QueueHandle_t reply_q = xQueueCreate(1, sizeof(uint32_t));
@@ -771,7 +796,7 @@ dd_task_list* remove_task_from_list(dd_task_list **head, uint32_t task_id)
 /*-----------------------------------*/
 
 /* Iterative bottom-up merge sort by absolute_deadline.
-   No memory allocation — only relinks existing nodes. */
+   No memory allocation - only relinks existing nodes. */
 dd_task_list* merge_sort_task_list(dd_task_list *head)
 {
 	if (head == NULL || head->next_task == NULL)
