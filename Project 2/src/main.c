@@ -1,5 +1,5 @@
 // Team Member Owen de Groot and Muntaj Gill
-// Student IDs: V00962387
+// Student IDs: V00962387 and V00974711
 // FULLY WORKING CODE - MINUS SAME TASK TIMING LIMITATION for T1 and T2
 
 /* RTOS includes - Standard libraries + FreeRTOS middleware */
@@ -23,8 +23,8 @@
 
 // LED colour assignments - one per user task so the board visually
 // indicates which task the EDF scheduler is currently executing.
-#define LED_T1  LED4   // green - Task 1
-#define LED_T2  LED5   // red   - Task 2
+#define LED_T1  LED5   // red - Task 1
+#define LED_T2  LED4   // green   - Task 2
 #define LED_T3  LED6   // blue  - Task 3
 
 /*-----------------------------------*/
@@ -49,27 +49,27 @@
 // Hyper-period: 1500ms
 // Utilisation: (95/250) + (150/500) + (250/750) = 0.713 - schedulable
 
-//#define T1_EXEC_MS    95
-//#define T1_PERIOD_MS  250
-//
-//#define T2_EXEC_MS    150
-//#define T2_PERIOD_MS  500
-//
-//#define T3_EXEC_MS    250
-//#define T3_PERIOD_MS  750
+#define T1_EXEC_MS    95
+#define T1_PERIOD_MS  250
+
+#define T2_EXEC_MS    150
+#define T2_PERIOD_MS  500
+
+#define T3_EXEC_MS    250
+#define T3_PERIOD_MS  750
 
 /*-------------- Test Bench #3 ----------------*/
 // Hyper-period: 500ms
 // Utilisation: (100/500) + (200/500) + (200/500) = 1.0 - boundary case
 
-#define T1_EXEC_MS    100 // 100
-#define T1_PERIOD_MS  500
-
-#define T2_EXEC_MS    200 // 200
-#define T2_PERIOD_MS  500
-
-#define T3_EXEC_MS    200 // 200
-#define T3_PERIOD_MS  500
+//#define T1_EXEC_MS    100 // 100
+//#define T1_PERIOD_MS  500
+//
+//#define T2_EXEC_MS    200 // 200
+//#define T2_PERIOD_MS  500
+//
+//#define T3_EXEC_MS    200 // 200
+//#define T3_PERIOD_MS  500
 
 /*-----------------------------------*/
 
@@ -188,13 +188,13 @@ int main(void)
 	STM_EVAL_LEDInit(LED_T1);
 	STM_EVAL_LEDInit(LED_T2);
 	STM_EVAL_LEDInit(LED_T3);
-	
+
 	// Ensure all LEDs start in the OFF state at boot.
 	STM_EVAL_LEDOff(LED3);
 	STM_EVAL_LEDOff(LED_T1);
 	STM_EVAL_LEDOff(LED_T2);
 	STM_EVAL_LEDOff(LED_T3);
-	
+
 	init_Queues();
 
 	init_FTasks();
@@ -348,13 +348,6 @@ void DDS(void *pvParameters)
             	case RELEASE_TASK:
             	{
             			msg.task.release_time = (uint32_t)now;
-
-            			// Suspend and demote current EDF head before reordering
-//            			if (active_list != NULL)
-//            			{
-//            					vTaskSuspend(active_list->task.t_handle);
-//            					vTaskPrioritySet(active_list->task.t_handle, LOW_PRIORITY);
-//            			}
 
             			add_task_to_list(&active_list, msg.task);
             			active_list = merge_sort_task_list(active_list);
@@ -566,7 +559,7 @@ void User_Task3(void *pvParameters)
 void create_dd_task(TaskHandle_t t_handle, task_type type,
                     uint32_t task_id, uint32_t absolute_deadline)
 {
-	QueueHandle_t reply_q = xQueueCreate(1, sizeof(uint32_t));
+	QueueHandle_t xResponseQueue = xQueueCreate(1, sizeof(uint32_t));
 
     dd_task task;
     task.t_handle          = t_handle;
@@ -580,14 +573,14 @@ void create_dd_task(TaskHandle_t t_handle, task_type type,
     message.type = RELEASE_TASK;
     message.task = task;
 
-    message.reply_queue = reply_q;
+    message.reply_queue = xResponseQueue;
 
     xQueueSend(xDDSQueue, &message, portMAX_DELAY);
     vTaskResume(xDDS_handle);     // wake DDS - it pre-empts us immediately
 
     uint32_t ack;
-    xQueueReceive(reply_q, &ack, portMAX_DELAY);
-    vQueueDelete(reply_q);
+    xQueueReceive(xResponseQueue, &ack, portMAX_DELAY);
+    vQueueDelete(xResponseQueue);
     // Returns here after DDS has processed the message and suspended itself
 
 }
@@ -598,7 +591,7 @@ void create_dd_task(TaskHandle_t t_handle, task_type type,
    Note: do NOT suspend here - DDS handles suspend/resume ordering itself. */
 void delete_dd_task(uint32_t task_id)
 {
-	QueueHandle_t reply_q = xQueueCreate(1, sizeof(uint32_t));
+	QueueHandle_t xResponseQueue = xQueueCreate(1, sizeof(uint32_t));
 
 	dd_task task;
 	task.t_handle          = NULL;
@@ -612,15 +605,15 @@ void delete_dd_task(uint32_t task_id)
 	message.type = COMPLETE_TASK;
 	message.task = task;
 
-	message.reply_queue = reply_q;
+	message.reply_queue = xResponseQueue;
 
 	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
 	vTaskResume(xDDS_handle);
 
 	uint32_t ack;
-	xQueueReceive(reply_q, &ack, portMAX_DELAY);
+	xQueueReceive(xResponseQueue, &ack, portMAX_DELAY);
 
-	vQueueDelete(reply_q);
+	vQueueDelete(xResponseQueue);
 
 
 	// don't suspend here - would race with DDS's own vTaskResume call
@@ -631,18 +624,18 @@ void delete_dd_task(uint32_t task_id)
 
 dd_task_list* get_active_dd_task_list(void)
 {
-	QueueHandle_t reply_q = xQueueCreate(1, sizeof(dd_task_list*));
+	QueueHandle_t xResponseQueue = xQueueCreate(1, sizeof(dd_task_list*));
 
 	dd_message message;
 	message.type = GET_ACTIVE_LIST;
-	message.reply_queue = reply_q;
+	message.reply_queue = xResponseQueue;
 
 	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
 	vTaskResume(xDDS_handle);
 
 	dd_task_list *result;
-	xQueueReceive(reply_q, &result, portMAX_DELAY);
-	vQueueDelete(reply_q);
+	xQueueReceive(xResponseQueue, &result, portMAX_DELAY);
+	vQueueDelete(xResponseQueue);
 
 	return result;
 }
@@ -651,18 +644,18 @@ dd_task_list* get_active_dd_task_list(void)
 
 dd_task_list* get_complete_dd_task_list(void)
 {
-	QueueHandle_t reply_q = xQueueCreate(1, sizeof(dd_task_list*));
+	QueueHandle_t xResponseQueue = xQueueCreate(1, sizeof(dd_task_list*));
 
 	dd_message message;
 	message.type = GET_COMPLETED_LIST;
-	message.reply_queue = reply_q;
+	message.reply_queue = xResponseQueue;
 
 	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
 	vTaskResume(xDDS_handle);
 
 	dd_task_list *result;
-	xQueueReceive(reply_q, &result, portMAX_DELAY);
-	vQueueDelete(reply_q);
+	xQueueReceive(xResponseQueue, &result, portMAX_DELAY);
+	vQueueDelete(xResponseQueue);
 
 	return result;
 }
@@ -671,18 +664,18 @@ dd_task_list* get_complete_dd_task_list(void)
 
 dd_task_list* get_overdue_dd_task_list(void)
 {
-	QueueHandle_t reply_q = xQueueCreate(1, sizeof(dd_task_list*));
+	QueueHandle_t xResponseQueue = xQueueCreate(1, sizeof(dd_task_list*));
 
 	dd_message message;
 	message.type = GET_OVERDUE_LIST;
-	message.reply_queue = reply_q;
+	message.reply_queue = xResponseQueue;
 
 	xQueueSend(xDDSQueue, &message, portMAX_DELAY);
 	vTaskResume(xDDS_handle);
 
 	dd_task_list *result;
-	xQueueReceive(reply_q, &result, portMAX_DELAY);
-	vQueueDelete(reply_q);
+	xQueueReceive(xResponseQueue, &result, portMAX_DELAY);
+	vQueueDelete(xResponseQueue);
 
 	return result;
 }
